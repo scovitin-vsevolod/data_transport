@@ -1,0 +1,335 @@
+<?php
+
+function data_transport_menu() {
+  $items = array();
+  $items['data_transport/%/%'] = array(
+    'page callback' => 'data_transport_export_nodes_as_json',
+    'page arguments' => array(1, 2),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['export/%/json'] = array(
+    'page callback' => 'data_transport_export_node_as_json',
+    'page arguments' => array(1),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/data_transport'] = array(
+    'title' => t('Data transport config'),
+    'description' => 'Data transport content type config',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('data_transport_admin_config_form'),
+    'access arguments' => array('administer site configuration'),
+  );
+  return $items;
+}
+
+function data_transport_export_nodes_as_json($version, $type) {
+  global $base_url;
+
+  $start = abs(intval(@$_REQUEST['skip']));
+  $length = min(abs(intval(@$_REQUEST['top'])), 100);
+  if (!$length) {
+    $length = 10;
+  }
+
+  $sort_by = 'n.changed';
+  $sort_order = 'DESC';
+  if (strtolower(@$_REQUEST['sort_order']) == 'asc') {
+    $sort_order = 'ASC';
+  }
+
+  $allowed_versions = ['v1'];
+  if (!in_array($version, $allowed_versions)) {
+    drupal_access_denied();
+    return;
+  }
+
+  $allowed_types = variable_get('data_transport_content_types', []);
+  if (!@$allowed_types[$type]) {
+    drupal_access_denied();
+    return;
+  }
+  $node_types = node_type_get_types();
+
+  $q = db_select('node', 'n');
+  $q->addField('n', 'nid', 'id');
+  $q->addField('n', 'uuid', 'uuid');
+  $q->addField('n', 'changed', 'updated');
+  $q->addField('n', 'type', 'type');
+  if ($allowed_types[$type] && ($type != 'treaty') && isset($node_types['treaty'])) {
+    $q->addField('od', 'field_odata_identifier_value', 'treaty');
+    $q->addField('t', 'uuid', 'treaty_uuid');
+    $q->innerJoin('field_data_field_treaty', 'tr', 'tr.entity_id = n.nid');
+    $q->innerJoin('node', 't', 't.nid = tr.field_treaty_target_id');
+    $q->innerJoin('field_data_field_odata_identifier', 'od', 'od.entity_id = t.nid');
+  }
+  $q->orderBy($sort_by, $sort_order);
+  $q->condition('n.type', $allowed_types[$type]);
+  $q->range($start, $length);
+  $rows = $q->execute()->fetchAll();
+
+  foreach ($rows as $id => $row) {
+    $row->data_url = $base_url . '/export/' . $row->uuid . '/json';
+    $row->link = $base_url . '/node/' . $row->id;
+    unset($row->uuid);
+
+    $rows[$id] = $row;
+  }
+  drupal_json_output($rows);
+  drupal_exit();
+}
+
+function data_transport_export_node_as_json($uuid) {
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->propertyCondition('uuid', $uuid);
+  $result = $query->execute();
+  if (empty($result)) {
+    drupal_not_found();
+  }
+  $node = reset($result['node']);
+  $node = node_load($node->nid);
+  if (!$node) {
+    drupal_not_found();
+    return;
+  }
+  $allowed_types = variable_get('data_transport_content_types', []);
+  if (!@$allowed_types[$node->type]) {
+    drupal_access_denied();
+    return;
+  }
+  return data_transport_export_node($node);
+}
+
+function data_transport_export_node($node) {
+  global $base_url;
+  $data = array(
+    'nid' => $node->nid,
+    'type' => $node->type,
+    'uuid' => $node->uuid,
+    'changed' => $node->changed,
+  );
+
+  $fields = field_info_instances('node', $node->type);
+  $w = entity_metadata_wrapper('node', $node);
+
+  foreach (array_keys($fields) as $field_name) {
+    $name = str_replace(['field_', '_field'], ['', ''], $field_name);
+    $info = field_info_field($field_name);
+
+    switch ($info['type']) {
+      case 'file':
+        $files = array();
+        if (!empty($node->{$field_name})) {
+          foreach ($node->{$field_name} as $lang => $lang_files) {
+            foreach($lang_files as $item) {
+              $files[$lang][] = array(
+                'filename' => $item['filename'],
+                'url' => file_create_url($item['uri']),
+              );
+            }
+          }
+        }
+        $data[$name] = $files;
+        break;
+
+      case 'entityreference':
+        $data[$name] = array();
+        if (!$node->{$field_name}) {
+          break;
+        }
+        if ($field_name == 'field_country') {
+          foreach ($node->{$field_name}[LANGUAGE_NONE] as $element) {
+            $country = node_load($element['target_id']);
+            $country_code = $country->field_country_iso3[LANGUAGE_NONE][0]['value'];
+            $data[$name][] = $country_code;
+          }
+        }
+        elseif (in_array($field_name, array('field_treaty', 'field_faolex_reference'))) {
+          foreach ($node->{$field_name}[LANGUAGE_NONE] as $element) {
+            $target = node_load($element['target_id']);
+            $original_id = !empty($target->field_original_id) ? $target->field_original_id[LANGUAGE_NONE][0]['value'] : NULL;
+            $odata_identifier = !empty($target->field_odata_identifier) ? $target->field_odata_identifier[LANGUAGE_NONE][0]['value'] : NULL;
+            $data[$name][] = array(
+              'uuid' => $target->uuid,
+              'type' => $target->type,
+              'url' => url(drupal_get_path_alias('uuid/node/' . $target->uuid), array('absolute' => TRUE)),
+              'original_id' => $original_id,
+              'odata_identifier' => $odata_identifier,
+            );
+          }
+        }
+        else {
+          foreach ($node->{$field_name}[LANGUAGE_NONE] as $element) {
+            $target = node_load($element['target_id']);
+            $data[$name][] = array(
+              'uuid' => $target->uuid,
+              'type' => $target->type,
+              'url' => url(drupal_get_path_alias('uuid/node/' . $target->uuid), array('absolute' => TRUE)),
+            );
+          }
+        }
+        break;
+
+      case 'taxonomy_term_reference':
+        $terms = array();
+        $values = $w->$field_name->value();
+        if (is_array($values)) {
+          if (!empty($values)) {
+            foreach ($values as $key => $value) {
+              $translations = [];
+              $terms[$key] = (object) array(
+                'label' => $value->name,
+                'url' => url(drupal_get_path_alias('taxonomy/term/' . $value->tid), array('absolute' => TRUE)),
+              );
+              $term = taxonomy_term_load($value->tid);
+              foreach ($term->name_field as $language => $translation) {
+                if ($language != 'en') {
+                  foreach ($translation as &$v) {
+                    unset($v['safe_value']);
+                  }
+                  $translations[$language] = $translation;
+                }
+              }
+              $terms[$key]->translations = $translations;
+            }
+            $data[$name] = $terms;
+            continue;
+          }
+        }
+        elseif ($values != NULL) {
+          $terms = array();
+          $terms[0] = (object) array(
+            'id' => $values->tid,
+            'url' => url('taxonomy/term/' . $values->tid, array('absolute' => TRUE)),
+            'label' => $values->name,
+          );
+          $data[$name] = $terms;
+          continue;
+        }
+        else {
+          $data[$name] = array();
+        }
+        break;
+
+      case 'datetime':
+        $data[$name] = array();
+        foreach ($node->{$field_name}[LANGUAGE_NONE] as $key => $element) {
+          unset($element['db']);
+          unset($element['timezone_db']);
+          unset($element['date_type']);
+          $node->{$field_name}[LANGUAGE_NONE][$key] = $element;
+        }
+        $v = $node->{$field_name};
+        foreach ($v as $language => &$d) {
+          foreach($d as &$d1) {
+            unset($d1['safe_value']);
+            if ($info['cardinality'] == 1) {
+              $data[$name][$language] = $d1;
+            }
+            else {
+              $data[$name][$language][] = $d1;
+            }
+          }
+        }
+        break;
+
+      case "number_integer":
+      case "text":
+        $data[$name] = array();
+        $v = $node->{$field_name};
+        foreach ($v as $language => &$d) {
+          foreach($d as &$d1) {
+            if ($info['cardinality'] == 1) {
+              $data[$name][$language] = $d1['value'];
+            }
+            else {
+              $data[$name][$language][] = $d1['value'];
+            }
+          }
+        }
+        break;
+
+      case "link_field":
+        $data[$name] = array();
+        $v = $node->{$field_name};
+        foreach ($v as $language => &$d) {
+          foreach($d as &$d1) {
+            unset($d1['attributes']);
+            if ($info['cardinality'] == 1) {
+              $data[$name][$language] = $d1;
+            }
+            else {
+              $data[$name][$language][] = $d1;
+            }
+          }
+        }
+        break;
+
+      case "text_with_summary":
+        $data[$name] = array();
+        $v = $node->{$field_name};
+        $data[$name] = array();
+        $v = $node->{$field_name};
+        foreach ($v as $language => &$d) {
+          foreach($d as &$d1) {
+            if ($info['cardinality'] == 1) {
+              $data[$name][$language] = ['value' => $d1['value'], 'summary' => $d1['summary']];
+            }
+            else {
+              $data[$name][$language][] = ['value' => $d1['value'], 'summary' => $d1['summary']];;
+            }
+          }
+        }
+        break;
+
+      default:
+        $v = $node->{$field_name};
+        foreach ($v as &$d) {
+          foreach($d as &$d1) {
+            unset($d1['safe_value']);
+          }
+        }
+        $data[$name] = $v;
+        break;
+    }
+  }
+
+  unset($data['field_data_source']);
+
+  $data['full_url'] = array('default' => $base_url . '/node/' . $node->nid);
+  foreach (language_list() as $code => $language) {
+    $data['full_url'][$code] = url('node/' . $node->nid, array('absolute' => TRUE, 'language' => $language));
+  }
+
+  drupal_json_output($data);
+  drupal_exit();
+}
+
+function data_transport_admin_config_form() {
+  $form = array('#tree' => FALSE);
+  $form['title'] = array(
+    '#type' => 'item',
+    '#markup' => t('<h1>Data export configuration</h1>' .
+      '<p>Check the items you wish to enable, then save configuration.</p>'),
+  );
+  $types = node_type_get_types();
+  $type_options = array();
+  foreach ($types as $type_name => $type) {
+    $type_options[$type_name] = t('!name (Machine name: !type_name)', ['!name' => $type->name, '!type_name' => $type_name]);
+  }
+  $form['data_transport_content_types'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Allowed bundles'),
+    '#options' => $type_options,
+    '#default_value' => variable_get('data_transport_content_types', []),
+  );
+  return system_settings_form($form);
+}
+
+function data_transport_admin_config_form_submit($form, &$form_state) {
+  drupal_set_message(t('Configuration successfully saved'));
+}
